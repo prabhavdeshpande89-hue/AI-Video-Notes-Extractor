@@ -144,7 +144,7 @@ function App() {
       if (youtubeLink) {
 
         const response = await fetch(
-          `http://127.0.0.1:8000/get-transcript?youtube_url=${youtubeLink}`
+          `https://ai-video-notes-extractor.onrender.com/get-transcript?youtube_url=${youtubeLink}`
         );
 
         const data = await response.json();
