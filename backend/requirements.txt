@@ -2,5 +2,6 @@ fastapi
 uvicorn
 openai
 python-dotenv
-youtube-transcript-api
 pymongo
+yt-dlp
+openai-whisper
