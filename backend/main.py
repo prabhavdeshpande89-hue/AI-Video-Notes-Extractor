@@ -3,13 +3,21 @@ import re
 import json
 import shutil
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import yt_dlp
 import whisper
+import bcrypt
+import jwt
 
-from fastapi import FastAPI, HTTPException
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Depends
+)
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
 from dotenv import load_dotenv
 from openai import OpenAI
 from pymongo import MongoClient
@@ -24,11 +32,25 @@ load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 MONGO_URI = os.getenv("MONGO_URI")
 
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+JWT_SECRET = os.getenv("JWT_SECRET")
+
+
 if not OPENROUTER_API_KEY:
     raise RuntimeError("OPENROUTER_API_KEY is missing in .env")
 
 if not MONGO_URI:
     raise RuntimeError("MONGO_URI is missing in .env")
+
+if not ADMIN_EMAIL:
+    raise RuntimeError("ADMIN_EMAIL is missing in .env")
+
+if not ADMIN_PASSWORD:
+    raise RuntimeError("ADMIN_PASSWORD is missing in .env")
+
+if not JWT_SECRET:
+    raise RuntimeError("JWT_SECRET is missing in .env")
 
 
 # ============================================================
@@ -48,7 +70,9 @@ client = OpenAI(
 mongo_client = MongoClient(MONGO_URI)
 
 db = mongo_client["video_notes_db"]
+
 notes_collection = db["notes"]
+users_collection = db["users"]
 
 
 # ============================================================
@@ -58,7 +82,7 @@ notes_collection = db["notes"]
 app = FastAPI(
     title="AI Video Notes Extractor",
     description="Extract YouTube audio, transcribe using Whisper and generate AI notes.",
-    version="2.0.0"
+    version="3.2.0"
 )
 
 
@@ -76,6 +100,187 @@ app.add_middleware(
 
 
 # ============================================================
+# AUTHENTICATION CONFIGURATION
+# ============================================================
+
+security = HTTPBearer()
+
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_HOURS = 24
+
+
+# ============================================================
+# REQUEST MODELS
+# ============================================================
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+# ============================================================
+# PASSWORD HASHING
+# ============================================================
+
+def hash_password(password: str) -> str:
+
+    password_bytes = password.encode("utf-8")
+
+    hashed = bcrypt.hashpw(
+        password_bytes,
+        bcrypt.gensalt()
+    )
+
+    return hashed.decode("utf-8")
+
+
+def verify_password(
+    password: str,
+    password_hash: str
+) -> bool:
+
+    return bcrypt.checkpw(
+        password.encode("utf-8"),
+        password_hash.encode("utf-8")
+    )
+
+
+# ============================================================
+# JWT TOKEN
+# ============================================================
+
+def create_access_token(
+    email: str,
+    role: str
+):
+
+    expire = datetime.now(timezone.utc) + timedelta(
+        hours=JWT_EXPIRATION_HOURS
+    )
+
+    payload = {
+        "email": email,
+        "role": role,
+        "exp": expire
+    }
+
+    return jwt.encode(
+        payload,
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM
+    )
+
+
+# ============================================================
+# GET CURRENT USER
+# ============================================================
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+
+    token = credentials.credentials
+
+    try:
+
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM]
+        )
+
+        email = payload.get("email")
+        role = payload.get("role")
+
+        if not email or not role:
+
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid authentication token."
+            )
+
+        return {
+            "email": email,
+            "role": role
+        }
+
+    except jwt.ExpiredSignatureError:
+
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication token has expired."
+        )
+
+    except jwt.InvalidTokenError:
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid authentication token."
+        )
+
+
+# ============================================================
+# ADMIN CHECK
+# ============================================================
+
+def require_admin(
+    current_user: dict = Depends(get_current_user)
+):
+
+    if current_user["role"] != "admin":
+
+        raise HTTPException(
+            status_code=403,
+            detail="Admin access required."
+        )
+
+    return current_user
+
+
+# ============================================================
+# CREATE ADMIN ACCOUNT
+# ============================================================
+
+def create_admin_if_not_exists():
+
+    existing_admin = users_collection.find_one({
+        "role": "admin"
+    })
+
+    if existing_admin:
+
+        print(
+            "Admin account already exists:",
+            existing_admin.get("email")
+        )
+
+        return
+
+    admin_document = {
+        "email": ADMIN_EMAIL.lower().strip(),
+        "password_hash": hash_password(
+            ADMIN_PASSWORD
+        ),
+        "role": "admin",
+        "created_at": datetime.now(timezone.utc)
+    }
+
+    users_collection.insert_one(
+        admin_document
+    )
+
+    print(
+        "Admin account created:",
+        ADMIN_EMAIL
+    )
+
+
+# ============================================================
 # WHISPER MODEL
 # ============================================================
 
@@ -87,10 +292,19 @@ print("Whisper model loaded successfully!")
 
 
 # ============================================================
+# CREATE ADMIN
+# ============================================================
+
+create_admin_if_not_exists()
+
+
+# ============================================================
 # DATA DIRECTORY
 # ============================================================
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(
+    os.path.abspath(__file__)
+)
 
 DATA_DIR = os.path.join(
     BASE_DIR,
@@ -98,7 +312,10 @@ DATA_DIR = os.path.join(
     "transcripts"
 )
 
-os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(
+    DATA_DIR,
+    exist_ok=True
+)
 
 
 # ============================================================
@@ -107,11 +324,192 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 @app.get("/")
 def home():
+
     return {
         "message": "Backend is running 🚀",
         "service": "AI Video Notes Extractor",
-        "version": "2.0.0"
+        "version": "3.2.0"
     }
+
+
+# ============================================================
+# REGISTER USER
+# ============================================================
+
+@app.post("/auth/register")
+def register_user(
+    data: RegisterRequest
+):
+
+    email = data.email.lower().strip()
+
+    if not email:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Email is required."
+        )
+
+    if len(data.password) < 6:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 6 characters."
+        )
+
+    existing_user = users_collection.find_one({
+        "email": email
+    })
+
+    if existing_user:
+
+        raise HTTPException(
+            status_code=400,
+            detail="An account with this email already exists."
+        )
+
+    user_document = {
+        "email": email,
+        "password_hash": hash_password(
+            data.password
+        ),
+        "role": "user",
+        "created_at": datetime.now(timezone.utc)
+    }
+
+    users_collection.insert_one(
+        user_document
+    )
+
+    return {
+        "success": True,
+        "message": "Account created successfully.",
+        "role": "user"
+    }
+
+
+# ============================================================
+# LOGIN
+# ============================================================
+
+@app.post("/auth/login")
+def login(
+    data: LoginRequest
+):
+
+    email = data.email.lower().strip()
+
+    user = users_collection.find_one({
+        "email": email
+    })
+
+    if not user:
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password."
+        )
+
+    if not verify_password(
+        data.password,
+        user["password_hash"]
+    ):
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password."
+        )
+
+    token = create_access_token(
+        email=user["email"],
+        role=user["role"]
+    )
+
+    return {
+        "success": True,
+        "access_token": token,
+        "token_type": "bearer",
+        "role": user["role"],
+        "email": user["email"]
+    }
+
+
+# ============================================================
+# CURRENT USER
+# ============================================================
+
+@app.get("/auth/me")
+def get_me(
+    current_user: dict = Depends(get_current_user)
+):
+
+    return {
+        "success": True,
+        "email": current_user["email"],
+        "role": current_user["role"]
+    }
+
+
+# ============================================================
+# ADMIN TEST
+# ============================================================
+
+@app.get("/admin/test")
+def admin_test(
+    current_admin: dict = Depends(require_admin)
+):
+
+    return {
+        "success": True,
+        "message": "Admin authentication is working.",
+        "email": current_admin["email"],
+        "role": current_admin["role"]
+    }
+
+
+# ============================================================
+# ADMIN - LIST USERS
+# ============================================================
+
+@app.get("/admin/users")
+def get_users(
+    current_admin: dict = Depends(require_admin)
+):
+
+    try:
+
+        users = list(
+            users_collection.find(
+                {},
+                {
+                    "_id": 0,
+                    "email": 1,
+                    "role": 1,
+                    "created_at": 1
+                }
+            ).sort(
+                "created_at",
+                -1
+            )
+        )
+
+        return {
+            "success": True,
+            "count": len(users),
+            "users": users
+        }
+
+    except Exception as e:
+
+        print(
+            "Admin users error:",
+            str(e)
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Could not retrieve users."
+        )
 
 
 # ============================================================
@@ -129,7 +527,10 @@ def extract_video_id(url: str):
 
     for pattern in patterns:
 
-        match = re.search(pattern, url)
+        match = re.search(
+            pattern,
+            url
+        )
 
         if match:
             return match.group(1)
@@ -141,7 +542,10 @@ def extract_video_id(url: str):
 # DOWNLOAD YOUTUBE AUDIO
 # ============================================================
 
-def download_audio(youtube_url: str, output_directory: str):
+def download_audio(
+    youtube_url: str,
+    output_directory: str
+):
 
     print("\nDownloading YouTube audio...")
     print("URL:", youtube_url)
@@ -173,9 +577,10 @@ def download_audio(youtube_url: str, output_directory: str):
 
     try:
 
-        with yt_dlp.YoutubeDL(ydl_options) as ydl:
+        with yt_dlp.YoutubeDL(
+            ydl_options
+        ) as ydl:
 
-            # Get video information first
             info = ydl.extract_info(
                 youtube_url,
                 download=False
@@ -191,24 +596,29 @@ def download_audio(youtube_url: str, output_directory: str):
                 extract_video_id(youtube_url)
             )
 
-            print("Video title:", video_title)
+            print(
+                "Video title:",
+                video_title
+            )
 
-            # Download audio
-            ydl.download([youtube_url])
+            ydl.download([
+                youtube_url
+            ])
 
-        # Expected MP3 file
         audio_path = os.path.join(
             output_directory,
             f"{video_id}.mp3"
         )
 
-        # Sometimes extension/name can differ,
-        # so search the directory if needed.
-        if not os.path.exists(audio_path):
+        if not os.path.exists(
+            audio_path
+        ):
 
             possible_files = [
                 file
-                for file in os.listdir(output_directory)
+                for file in os.listdir(
+                    output_directory
+                )
                 if file.endswith(".mp3")
             ]
 
@@ -219,20 +629,32 @@ def download_audio(youtube_url: str, output_directory: str):
                     possible_files[0]
                 )
 
-        if not os.path.exists(audio_path):
+        if not os.path.exists(
+            audio_path
+        ):
 
             raise FileNotFoundError(
                 "Audio file was not created by yt-dlp."
             )
 
-        print("Audio downloaded successfully:")
+        print(
+            "Audio downloaded successfully:"
+        )
+
         print(audio_path)
 
-        return audio_path, video_title, video_id
+        return (
+            audio_path,
+            video_title,
+            video_id
+        )
 
     except Exception as e:
 
-        print("YouTube download error:", str(e))
+        print(
+            "YouTube download error:",
+            str(e)
+        )
 
         raise Exception(
             f"Could not download YouTube audio: {str(e)}"
@@ -243,10 +665,18 @@ def download_audio(youtube_url: str, output_directory: str):
 # WHISPER TRANSCRIPTION
 # ============================================================
 
-def transcribe_audio(audio_path: str):
+def transcribe_audio(
+    audio_path: str
+):
 
-    print("\nStarting Whisper transcription...")
-    print("Audio:", audio_path)
+    print(
+        "\nStarting Whisper transcription..."
+    )
+
+    print(
+        "Audio:",
+        audio_path
+    )
 
     try:
 
@@ -266,7 +696,9 @@ def transcribe_audio(audio_path: str):
                 "Whisper returned an empty transcript."
             )
 
-        print("\nTranscription completed.")
+        print(
+            "\nTranscription completed."
+        )
 
         print(
             "Transcript length:",
@@ -292,9 +724,14 @@ def transcribe_audio(audio_path: str):
 # AI NOTES GENERATION
 # ============================================================
 
-def generate_notes(transcript: str, video_title: str):
+def generate_notes(
+    transcript: str,
+    video_title: str
+):
 
-    print("\nGenerating AI notes...")
+    print(
+        "\nGenerating AI notes..."
+    )
 
     prompt = f"""
 You are an expert educational note-taking assistant.
@@ -369,7 +806,9 @@ Rules:
                 "AI returned empty notes."
             )
 
-        print("AI notes generated successfully.")
+        print(
+            "AI notes generated successfully."
+        )
 
         return notes
 
@@ -394,7 +833,8 @@ def save_transcript_locally(
     video_title: str,
     youtube_url: str,
     transcript: str,
-    notes: str
+    notes: str,
+    user_email: str
 ):
 
     safe_video_id = re.sub(
@@ -414,7 +854,10 @@ def save_transcript_locally(
         "youtube_url": youtube_url,
         "transcript": transcript,
         "notes": notes,
-        "created_at": datetime.utcnow().isoformat()
+        "user_email": user_email,
+        "created_at": datetime.now(
+            timezone.utc
+        ).isoformat()
     }
 
     with open(
@@ -445,7 +888,8 @@ def save_to_mongodb(
     video_title: str,
     youtube_url: str,
     transcript: str,
-    notes: str
+    notes: str,
+    user_email: str
 ):
 
     document = {
@@ -454,7 +898,10 @@ def save_to_mongodb(
         "youtube_url": youtube_url,
         "transcript": transcript,
         "notes": notes,
-        "created_at": datetime.utcnow()
+        "user_email": user_email,
+        "created_at": datetime.now(
+            timezone.utc
+        )
     }
 
     try:
@@ -475,8 +922,6 @@ def save_to_mongodb(
             str(e)
         )
 
-        # Don't stop note generation if MongoDB
-        # happens to fail.
         print(
             "Continuing without MongoDB save..."
         )
@@ -487,7 +932,10 @@ def save_to_mongodb(
 # ============================================================
 
 @app.get("/get-transcript")
-def get_transcript(youtube_url: str):
+def get_transcript(
+    youtube_url: str,
+    current_user: dict = Depends(get_current_user)
+):
 
     if not youtube_url:
 
@@ -496,7 +944,6 @@ def get_transcript(youtube_url: str):
             detail="YouTube URL is required."
         )
 
-    # Validate YouTube URL
     video_id = extract_video_id(
         youtube_url
     )
@@ -508,77 +955,72 @@ def get_transcript(youtube_url: str):
             detail="Invalid YouTube URL."
         )
 
-    print("\n" + "=" * 60)
+    user_email = current_user["email"]
+
+    print(
+        "\n" + "=" * 60
+    )
 
     print(
         "Processing video:",
         youtube_url
     )
 
-    print("=" * 60)
+    print(
+        "Authenticated user:",
+        user_email
+    )
 
-    # Temporary directory for audio
+    print(
+        "=" * 60
+    )
+
     temp_directory = tempfile.mkdtemp(
         prefix="video_notes_"
     )
 
     try:
 
-        # ----------------------------------------------------
-        # STEP 1: DOWNLOAD AUDIO
-        # ----------------------------------------------------
-
+        # STEP 1
         audio_path, video_title, video_id = download_audio(
             youtube_url,
             temp_directory
         )
 
-        # ----------------------------------------------------
-        # STEP 2: TRANSCRIBE USING WHISPER
-        # ----------------------------------------------------
-
+        # STEP 2
         transcript = transcribe_audio(
             audio_path
         )
 
-        # ----------------------------------------------------
-        # STEP 3: GENERATE AI NOTES
-        # ----------------------------------------------------
-
+        # STEP 3
         notes = generate_notes(
             transcript,
             video_title
         )
 
-        # ----------------------------------------------------
-        # STEP 4: SAVE LOCALLY
-        # ----------------------------------------------------
-
+        # STEP 4
         save_transcript_locally(
             video_id,
             video_title,
             youtube_url,
             transcript,
-            notes
+            notes,
+            user_email
         )
 
-        # ----------------------------------------------------
-        # STEP 5: SAVE TO MONGODB
-        # ----------------------------------------------------
-
+        # STEP 5
         save_to_mongodb(
             video_id,
             video_title,
             youtube_url,
             transcript,
-            notes
+            notes,
+            user_email
         )
 
-        print("\nProcessing completed successfully!")
-
-        # ----------------------------------------------------
-        # RESPONSE TO FRONTEND
-        # ----------------------------------------------------
+        print(
+            "\nProcessing completed successfully!"
+        )
 
         return {
             "success": True,
@@ -587,6 +1029,7 @@ def get_transcript(youtube_url: str):
             "youtube_url": youtube_url,
             "transcript": transcript,
             "notes": notes,
+            "user_email": user_email,
             "message": "Video processed successfully."
         }
 
@@ -608,13 +1051,11 @@ def get_transcript(youtube_url: str):
 
     finally:
 
-        # ----------------------------------------------------
-        # CLEAN TEMPORARY AUDIO
-        # ----------------------------------------------------
-
         try:
 
-            if os.path.exists(temp_directory):
+            if os.path.exists(
+                temp_directory
+            ):
 
                 shutil.rmtree(
                     temp_directory,
@@ -638,13 +1079,35 @@ def get_transcript(youtube_url: str):
 # ============================================================
 
 @app.get("/history")
-def get_history():
+def get_history(
+    current_user: dict = Depends(get_current_user)
+):
 
     try:
 
+        # ----------------------------------------------------
+        # ADMIN
+        # Admin can see ALL notes
+        # ----------------------------------------------------
+
+        if current_user["role"] == "admin":
+
+            query = {}
+
+        # ----------------------------------------------------
+        # NORMAL USER
+        # User can see ONLY their own notes
+        # ----------------------------------------------------
+
+        else:
+
+            query = {
+                "user_email": current_user["email"]
+            }
+
         history = list(
             notes_collection.find(
-                {},
+                query,
                 {
                     "_id": 0
                 }
@@ -670,6 +1133,100 @@ def get_history():
         raise HTTPException(
             status_code=500,
             detail="Could not retrieve history."
+        )
+
+
+# ============================================================
+# DELETE NOTE
+# ============================================================
+
+@app.delete("/notes/{video_id}")
+def delete_note(
+    video_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+
+    try:
+
+        # ----------------------------------------------------
+        # VALIDATE VIDEO ID
+        # ----------------------------------------------------
+
+        if not video_id:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Video ID is required."
+            )
+
+        # ----------------------------------------------------
+        # ADMIN
+        # Admin can delete any note
+        # ----------------------------------------------------
+
+        if current_user["role"] == "admin":
+
+            result = notes_collection.delete_one({
+                "video_id": video_id
+            })
+
+        # ----------------------------------------------------
+        # NORMAL USER
+        # User can delete ONLY their own note
+        # ----------------------------------------------------
+
+        else:
+
+            result = notes_collection.delete_one({
+                "video_id": video_id,
+                "user_email": current_user["email"]
+            })
+
+        # ----------------------------------------------------
+        # NOT FOUND
+        # ----------------------------------------------------
+
+        if result.deleted_count == 0:
+
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "Note not found or you do not "
+                    "have permission to delete it."
+                )
+            )
+
+        # ----------------------------------------------------
+        # SUCCESS
+        # ----------------------------------------------------
+
+        print(
+            "Note deleted:",
+            video_id,
+            "by",
+            current_user["email"]
+        )
+
+        return {
+            "success": True,
+            "message": "Note deleted successfully.",
+            "video_id": video_id
+        }
+
+    except HTTPException:
+
+        raise
+
+    except Exception as e:
+
+        print(
+            "Delete note error:",
+            str(e)
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Could not delete note."
         )
 
 
