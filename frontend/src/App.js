@@ -3,7 +3,7 @@ import ReactMarkdown from "react-markdown";
 import jsPDF from "jspdf";
 import "./App.css";
 
-const API_URL = "http://15.252.182.106:8000";
+const API_URL = "/api";
 
 function App() {
   // ============================================================
