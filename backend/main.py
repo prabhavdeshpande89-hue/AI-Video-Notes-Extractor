@@ -566,6 +566,21 @@ def download_audio(
 
         "no_warnings": False,
 
+        "cookiefiles": "/home/ubuntu/cookies.txt",
+
+        "js_runtimes": {
+            "nodes": {}
+        },
+
+        "extract_args": {
+            "yotube":{
+                "player-client": ["web_embedded"]
+            },
+            "yotubepot-bgutihttp":{
+                "base_url": ["http://127.0.0.1:4416"]
+            }
+        },
+        
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
