@@ -687,19 +687,77 @@ def transcribe_audio(
     audio_path: str
 ):
 
-    print(
-        "\nStarting Whisper transcription..."
-    )
+    print("\n" + "=" * 60)
+    print("WHISPER TRANSCRIPTION")
+    print("=" * 60)
 
-    print(
-        "Audio:",
-        audio_path
-    )
+    print("Audio path:", audio_path)
 
     try:
 
+        # --------------------------------------------------------
+        # STEP 1: Verify audio file
+        # --------------------------------------------------------
+
+        if not os.path.exists(audio_path):
+
+            raise FileNotFoundError(
+                f"Audio file does not exist: {audio_path}"
+            )
+
+        file_size = os.path.getsize(audio_path)
+
+        print(
+            "Audio file size:",
+            file_size,
+            "bytes"
+        )
+
+        if file_size == 0:
+
+            raise Exception(
+                "Audio file is empty."
+            )
+
+        # --------------------------------------------------------
+        # STEP 2: Load audio through Whisper/FFmpeg
+        # --------------------------------------------------------
+
+        print(
+            "Loading audio with Whisper..."
+        )
+
+        audio = whisper.load_audio(
+            audio_path
+        )
+
+        print(
+            "Audio samples:",
+            len(audio)
+        )
+
+        print(
+            "Audio duration:",
+            len(audio) / 16000,
+            "seconds"
+        )
+
+        if len(audio) == 0:
+
+            raise Exception(
+                "Whisper loaded zero audio samples."
+            )
+
+        # --------------------------------------------------------
+        # STEP 3: Transcribe
+        # --------------------------------------------------------
+
+        print(
+            "Starting Whisper transcription..."
+        )
+
         result = whisper_model.transcribe(
-            audio_path,
+            audio,
             fp16=False
         )
 
@@ -715,7 +773,7 @@ def transcribe_audio(
             )
 
         print(
-            "\nTranscription completed."
+            "Transcription completed."
         )
 
         print(
@@ -724,13 +782,15 @@ def transcribe_audio(
             "characters"
         )
 
+        print("=" * 60)
+
         return transcript
 
     except Exception as e:
 
         print(
             "Whisper transcription error:",
-            str(e)
+            repr(e)
         )
 
         raise Exception(
