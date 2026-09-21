@@ -566,21 +566,24 @@ def download_audio(
 
         "no_warnings": False,
 
-        "cookiefiles": "/home/ubuntu/cookies.txt",
+        # YouTube authentication cookies
+        "cookiefile": "/home/ubuntu/cookies.txt",
 
+        # JavaScript runtime required by current YouTube extraction
         "js_runtimes": {
-            "nodes": {}
+            "node": {}
         },
 
-        "extract_args": {
-            "yotube":{
+        # Use the same client that worked from the terminal
+        "extractor_args": {
+            "youtube": {
                 "player-client": ["web_embedded"]
             },
-            "yotubepot-bgutihttp":{
+            "youtubepot-bgutilhttp": {
                 "base_url": ["http://127.0.0.1:4416"]
             }
         },
-        
+
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",

@@ -18,7 +18,7 @@ function UploadForm() {
       setLoading(true);
 
       const response = await fetch(
-        `http://127.0.0.1:8000/get-transcript?youtube_url=${youtubeUrl}`
+        '/api/get-transcript?youtube_url=${youtubeUrl}'
       );
 
       const data = await response.json();
