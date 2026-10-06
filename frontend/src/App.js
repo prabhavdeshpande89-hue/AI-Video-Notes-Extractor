@@ -376,34 +376,55 @@ function App() {
   };
 
   // ============================================================
-  // GENERATE NOTES
-  // ============================================================
+// GENERATE NOTES
+// ============================================================
 
-  const handleGenerate = async () => {
-    if (!youtubeLink.trim()) {
-      alert("Please paste a YouTube video URL!");
-      return;
+const getYouTubeVideoId = (url) => {
+  try {
+    const parsedUrl = new URL(url);
+
+    if (parsedUrl.hostname.includes("youtu.be")) {
+      return parsedUrl.pathname.replace("/", "").trim();
     }
 
-    const token = sessionStorage.getItem("access_token");
-
-    if (!token) {
-      setAuthError("Please login to generate notes.");
-      return;
+    if (parsedUrl.hostname.includes("youtube.com")) {
+      return parsedUrl.searchParams.get("v");
     }
 
+    return null;
+  } catch {
+    return null;
+  }
+};
+
+
+const waitForGeneratedNotes = async (youtubeUrl, token) => {
+  const videoId = getYouTubeVideoId(youtubeUrl);
+
+  if (!videoId) {
+    throw new Error("Could not identify the YouTube video.");
+  }
+
+  // Check every 10 seconds for up to 10 minutes.
+  const maxAttempts = 60;
+  const interval = 10000;
+
+  console.log(
+    "Waiting for backend processing to finish..."
+  );
+
+  for (
+    let attempt = 1;
+    attempt <= maxAttempts;
+    attempt++
+  ) {
     try {
-      setLoading(true);
-      setNotes("");
-      setVideoTitle("");
-      setSelectedHistory(null);
-
-      const encodedURL = encodeURIComponent(
-        youtubeLink.trim()
+      console.log(
+        `Checking generated notes... ${attempt}/${maxAttempts}`
       );
 
       const response = await fetch(
-        `${API_URL}/get-transcript?youtube_url=${encodedURL}`,
+        `${API_URL}/history`,
         {
           headers: {
             Authorization: `Bearer ${token}`,
@@ -411,41 +432,180 @@ function App() {
         }
       );
 
-      const data = await response.json();
-
       if (response.status === 401) {
         handleLogout();
-        return;
+        throw new Error("Session expired.");
       }
 
-      if (response.ok && data.success) {
-        setNotes(
-          data.notes || "No notes generated."
+      if (response.ok) {
+        const data = await response.json();
+
+        const generatedNote = (data.history || []).find(
+          (item) =>
+            item.video_id === videoId &&
+            item.notes &&
+            item.notes.trim()
         );
 
-        setVideoTitle(
-          data.video_title || "YouTube Video"
-        );
+        if (generatedNote) {
+          console.log(
+            "Generated notes found successfully."
+          );
 
-        setShowHistory(false);
-      } else {
-        const errorMessage =
-          data.detail ||
-          data.message ||
-          "Failed to process the video.";
-
-        setNotes(`❌ Error: ${errorMessage}`);
+          return generatedNote;
+        }
       }
     } catch (error) {
-      console.error("Frontend error:", error);
+      if (error.message === "Session expired.") {
+        throw error;
+      }
+
+      console.log(
+        "History check failed, retrying...",
+        error
+      );
+    }
+
+    if (attempt < maxAttempts) {
+      await new Promise((resolve) =>
+        setTimeout(resolve, interval)
+      );
+    }
+  }
+
+  throw new Error(
+    "The video is taking longer than expected to process."
+  );
+};
+
+
+const handleGenerate = async () => {
+  if (!youtubeLink.trim()) {
+    alert("Please paste a YouTube video URL!");
+    return;
+  }
+
+  const token = sessionStorage.getItem("access_token");
+
+  if (!token) {
+    setAuthError("Please login to generate notes.");
+    return;
+  }
+
+  try {
+    setLoading(true);
+    setNotes("");
+    setVideoTitle("");
+    setSelectedHistory(null);
+
+    const encodedURL = encodeURIComponent(
+      youtubeLink.trim()
+    );
+
+    const response = await fetch(
+      `${API_URL}/get-transcript?youtube_url=${encodedURL}`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      }
+    );
+
+    const data = await response.json();
+
+    if (response.status === 401) {
+      handleLogout();
+      return;
+    }
+
+    if (response.ok && data.success) {
+      setNotes(
+        data.notes || "No notes generated."
+      );
+
+      setVideoTitle(
+        data.video_title || "YouTube Video"
+      );
+
+      setShowHistory(false);
+      return;
+    }
+
+    const errorMessage =
+      data.detail ||
+      data.message ||
+      "Failed to process the video.";
+
+    setNotes(`❌ Error: ${errorMessage}`);
+  } catch (error) {
+    console.error(
+      "Initial backend request ended:",
+      error
+    );
+
+    /*
+     * Vercel can timeout the frontend request while
+     * the EC2 backend continues processing.
+     *
+     * Do not immediately show a backend error.
+     * Instead, check the user's history until the
+     * backend saves the generated notes.
+     */
+
+    try {
+      console.log(
+        "Backend request timed out or disconnected."
+      );
+
+      console.log(
+        "Checking history for completed notes..."
+      );
+
+      const generatedNote =
+        await waitForGeneratedNotes(
+          youtubeLink.trim(),
+          token
+        );
 
       setNotes(
-        "❌ Error connecting to backend. Please make sure the FastAPI server is running."
+        generatedNote.notes ||
+          "No notes generated."
       );
-    } finally {
-      setLoading(false);
+
+      setVideoTitle(
+        generatedNote.video_title ||
+          "YouTube Video"
+      );
+
+      setYoutubeLink(
+        generatedNote.youtube_url ||
+          youtubeLink.trim()
+      );
+
+      setShowHistory(false);
+
+      console.log(
+        "Notes loaded successfully after backend timeout."
+      );
+    } catch (pollError) {
+      console.error(
+        "Unable to retrieve generated notes:",
+        pollError
+      );
+
+      if (
+        pollError.message !==
+        "Session expired."
+      ) {
+        setNotes(
+          "❌ The video could not be completed. Please try again."
+        );
+      }
     }
-  };
+  } finally {
+    setLoading(false);
+  }
+};
 
   // ============================================================
   // FETCH USER HISTORY
