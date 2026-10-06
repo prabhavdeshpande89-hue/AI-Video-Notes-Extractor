@@ -3,6 +3,7 @@ import re
 import json
 import shutil
 import tempfile
+import subprocess
 from datetime import datetime, timedelta, timezone
 
 import yt_dlp
@@ -683,6 +684,12 @@ def download_audio(
 # WHISPER TRANSCRIPTION
 # ============================================================
 
+# Whisper has been tested successfully on this EC2 server with
+# 1-minute, 5-minute and 10-minute audio sections.
+# Long videos are processed in 5-minute chunks.
+WHISPER_CHUNK_SECONDS = 5 * 60
+
+
 def transcribe_audio(
     audio_path: str
 ):
@@ -692,6 +699,8 @@ def transcribe_audio(
     print("=" * 60)
 
     print("Audio path:", audio_path)
+
+    chunk_directory = None
 
     try:
 
@@ -720,50 +729,217 @@ def transcribe_audio(
             )
 
         # --------------------------------------------------------
-        # STEP 2: Load audio through Whisper/FFmpeg
+        # STEP 2: Get audio duration
         # --------------------------------------------------------
 
         print(
-            "Loading audio with Whisper..."
+            "Checking audio duration..."
         )
 
-        audio = whisper.load_audio(
+        ffprobe_command = [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
             audio_path
+        ]
+
+        duration_result = subprocess.run(
+            ffprobe_command,
+            capture_output=True,
+            text=True,
+            check=True
         )
 
-        print(
-            "Audio samples:",
-            len(audio)
-        )
+        duration_text = duration_result.stdout.strip()
+
+        if not duration_text:
+
+            raise Exception(
+                "Could not determine audio duration."
+            )
+
+        duration = float(duration_text)
 
         print(
             "Audio duration:",
-            len(audio) / 16000,
+            round(duration, 2),
             "seconds"
         )
 
-        if len(audio) == 0:
+        if duration <= 0:
 
             raise Exception(
-                "Whisper loaded zero audio samples."
+                "Audio duration is zero."
             )
 
         # --------------------------------------------------------
-        # STEP 3: Transcribe
+        # STEP 3: Create temporary chunk directory
         # --------------------------------------------------------
 
+        chunk_directory = tempfile.mkdtemp(
+            prefix="whisper_chunks_"
+        )
+
+        total_chunks = (
+            int(duration // WHISPER_CHUNK_SECONDS)
+            + (
+                1
+                if duration % WHISPER_CHUNK_SECONDS > 0
+                else 0
+            )
+        )
+
         print(
-            "Starting Whisper transcription..."
+            "Whisper chunk size:",
+            WHISPER_CHUNK_SECONDS,
+            "seconds"
         )
 
-        result = whisper_model.transcribe(
-            audio,
-            fp16=False
+        print(
+            "Total chunks:",
+            total_chunks
         )
 
-        transcript = result.get(
-            "text",
-            ""
+        # --------------------------------------------------------
+        # STEP 4: Transcribe each chunk
+        # --------------------------------------------------------
+
+        transcripts = []
+
+        for chunk_index in range(total_chunks):
+
+            start_time = (
+                chunk_index * WHISPER_CHUNK_SECONDS
+            )
+
+            remaining = duration - start_time
+
+            chunk_duration = min(
+                WHISPER_CHUNK_SECONDS,
+                remaining
+            )
+
+            chunk_number = chunk_index + 1
+
+            chunk_path = os.path.join(
+                chunk_directory,
+                f"chunk_{chunk_number:03d}.wav"
+            )
+
+            print("\n" + "-" * 60)
+
+            print(
+                f"Processing Whisper chunk "
+                f"{chunk_number}/{total_chunks}"
+            )
+
+            print(
+                "Start:",
+                round(start_time, 2),
+                "seconds"
+            )
+
+            print(
+                "Duration:",
+                round(chunk_duration, 2),
+                "seconds"
+            )
+
+            # ----------------------------------------------------
+            # Convert chunk to 16 kHz mono WAV
+            # ----------------------------------------------------
+
+            ffmpeg_command = [
+                "ffmpeg",
+                "-y",
+                "-loglevel", "error",
+                "-ss", str(start_time),
+                "-i", audio_path,
+                "-t", str(chunk_duration),
+                "-ac", "1",
+                "-ar", "16000",
+                "-c:a", "pcm_s16le",
+                chunk_path
+            ]
+
+            subprocess.run(
+                ffmpeg_command,
+                check=True
+            )
+
+            if not os.path.exists(chunk_path):
+
+                raise Exception(
+                    f"Whisper chunk {chunk_number} "
+                    "was not created."
+                )
+
+            chunk_size = os.path.getsize(
+                chunk_path
+            )
+
+            if chunk_size == 0:
+
+                raise Exception(
+                    f"Whisper chunk {chunk_number} "
+                    "is empty."
+                )
+
+            print(
+                "Chunk file size:",
+                chunk_size,
+                "bytes"
+            )
+
+            # ----------------------------------------------------
+            # Whisper transcription
+            # ----------------------------------------------------
+
+            print(
+                f"Starting Whisper transcription "
+                f"for chunk {chunk_number}..."
+            )
+
+            result = whisper_model.transcribe(
+                chunk_path,
+                fp16=False
+            )
+
+            chunk_transcript = result.get(
+                "text",
+                ""
+            ).strip()
+
+            if not chunk_transcript:
+
+                print(
+                    f"Warning: chunk {chunk_number} "
+                    "returned an empty transcript."
+                )
+
+            else:
+
+                transcripts.append(
+                    chunk_transcript
+                )
+
+                print(
+                    f"Chunk {chunk_number} completed."
+                )
+
+                print(
+                    "Chunk transcript length:",
+                    len(chunk_transcript),
+                    "characters"
+                )
+
+        # --------------------------------------------------------
+        # STEP 5: Combine all transcripts
+        # --------------------------------------------------------
+
+        transcript = "\n\n".join(
+            transcripts
         ).strip()
 
         if not transcript:
@@ -772,8 +948,17 @@ def transcribe_audio(
                 "Whisper returned an empty transcript."
             )
 
+        print("\n" + "=" * 60)
+
         print(
             "Transcription completed."
+        )
+
+        print(
+            "Chunks successfully transcribed:",
+            len(transcripts),
+            "/",
+            total_chunks
         )
 
         print(
@@ -786,6 +971,17 @@ def transcribe_audio(
 
         return transcript
 
+    except subprocess.CalledProcessError as e:
+
+        print(
+            "FFmpeg/FFprobe error:",
+            str(e)
+        )
+
+        raise Exception(
+            f"Audio processing failed: {str(e)}"
+        )
+
     except Exception as e:
 
         print(
@@ -796,6 +992,25 @@ def transcribe_audio(
         raise Exception(
             f"Whisper transcription failed: {str(e)}"
         )
+
+    finally:
+
+        # --------------------------------------------------------
+        # STEP 6: Clean temporary chunks
+        # --------------------------------------------------------
+
+        if chunk_directory and os.path.exists(
+            chunk_directory
+        ):
+
+            shutil.rmtree(
+                chunk_directory,
+                ignore_errors=True
+            )
+
+            print(
+                "Temporary Whisper chunks cleaned."
+            )
 
 
 # ============================================================
