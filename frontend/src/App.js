@@ -511,7 +511,132 @@ const handleGenerate = async () => {
       }
     );
 
-    const data = await response.json();
+    /*
+     * IMPORTANT:
+     *
+     * Vercel can return 502 / 504 / 524 while
+     * the EC2 backend is still processing the video.
+     *
+     * Do NOT treat these as an immediate failure.
+     * Instead, check the history for the completed notes.
+     */
+
+    if (
+      response.status === 502 ||
+      response.status === 504 ||
+      response.status === 524
+    ) {
+      console.log(
+        `Gateway timeout (${response.status}).`
+      );
+
+      console.log(
+        "EC2 may still be processing. Starting history polling..."
+      );
+
+      try {
+        const generatedNote =
+          await waitForGeneratedNotes(
+            youtubeLink.trim(),
+            token
+          );
+
+        setNotes(
+          generatedNote.notes ||
+            "No notes generated."
+        );
+
+        setVideoTitle(
+          generatedNote.video_title ||
+            "YouTube Video"
+        );
+
+        setYoutubeLink(
+          generatedNote.youtube_url ||
+            youtubeLink.trim()
+        );
+
+        setShowHistory(false);
+
+        console.log(
+          "Notes successfully recovered from history."
+        );
+
+        return;
+      } catch (pollError) {
+        console.error(
+          "History polling failed:",
+          pollError
+        );
+
+        if (
+          pollError.message ===
+          "Session expired."
+        ) {
+          return;
+        }
+
+        setNotes(
+          "❌ The video is still processing or took too long. Please check Notes shortly."
+        );
+
+        return;
+      }
+    }
+
+    let data;
+
+    try {
+      data = await response.json();
+    } catch (jsonError) {
+      console.error(
+        "Could not read backend response:",
+        jsonError
+      );
+
+      /*
+       * The gateway may have interrupted the request.
+       * Check history before showing an error.
+       */
+
+      try {
+        const generatedNote =
+          await waitForGeneratedNotes(
+            youtubeLink.trim(),
+            token
+          );
+
+        setNotes(
+          generatedNote.notes ||
+            "No notes generated."
+        );
+
+        setVideoTitle(
+          generatedNote.video_title ||
+            "YouTube Video"
+        );
+
+        setYoutubeLink(
+          generatedNote.youtube_url ||
+            youtubeLink.trim()
+        );
+
+        setShowHistory(false);
+
+        return;
+      } catch (pollError) {
+        console.error(
+          "Could not recover notes:",
+          pollError
+        );
+
+        setNotes(
+          "❌ Unable to retrieve the generated notes."
+        );
+
+        return;
+      }
+    }
 
     if (response.status === 401) {
       handleLogout();
@@ -528,35 +653,35 @@ const handleGenerate = async () => {
       );
 
       setShowHistory(false);
+
       return;
     }
+
+    /*
+     * Genuine backend error.
+     */
 
     const errorMessage =
       data.detail ||
       data.message ||
       "Failed to process the video.";
 
-    setNotes(`❌ Error: ${errorMessage}`);
+    setNotes(
+      `❌ Error: ${errorMessage}`
+    );
+
   } catch (error) {
     console.error(
-      "Initial backend request ended:",
+      "Frontend request error:",
       error
     );
 
     /*
-     * Vercel can timeout the frontend request while
-     * the EC2 backend continues processing.
-     *
-     * Do not immediately show a backend error.
-     * Instead, check the user's history until the
-     * backend saves the generated notes.
+     * Network failure / connection interruption.
+     * EC2 may still be processing.
      */
 
     try {
-      console.log(
-        "Backend request timed out or disconnected."
-      );
-
       console.log(
         "Checking history for completed notes..."
       );
@@ -584,9 +709,6 @@ const handleGenerate = async () => {
 
       setShowHistory(false);
 
-      console.log(
-        "Notes loaded successfully after backend timeout."
-      );
     } catch (pollError) {
       console.error(
         "Unable to retrieve generated notes:",
@@ -602,6 +724,7 @@ const handleGenerate = async () => {
         );
       }
     }
+
   } finally {
     setLoading(false);
   }
